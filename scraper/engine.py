@@ -83,7 +83,7 @@ class DeepDiscoveryCrawler:
         for row in anchor_rows:
             href = str(row.get("href", "")).strip()
             anchor_text = str(row.get("anchor_text", "")).strip()
-            parent_context = str(row.get("parent_context") or row.get("context") or "").strip()
+            context = str(row.get("context", "")).strip()
             resolved_url = self._normalize_url(page_url, href)
             if not resolved_url:
                 continue
@@ -92,7 +92,7 @@ class DeepDiscoveryCrawler:
                 {
                     "url": resolved_url,
                     "anchor_text": anchor_text,
-                    "parent_context": parent_context,
+                    "context": context,
                 }
             )
 
