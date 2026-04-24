@@ -10,7 +10,7 @@ from typing import Any
 
 from groq import Groq  # type: ignore[import-not-found]
 
-from ai.prompt_builder import build_extraction_prompt, build_router_prompt
+from ai.prompt_builder import build_extraction_prompt, build_navigation_prompt, build_router_prompt
 
 
 def _get_client() -> Groq:
@@ -113,6 +113,42 @@ def _coerce_id_list(payload: Any) -> list[int]:
         except (TypeError, ValueError):
             continue
     return ids
+
+
+def _coerce_priority_queue(payload: Any) -> list[dict[str, Any]]:
+    candidates: Any = payload
+    if isinstance(payload, dict):
+        candidates = payload.get("priority_queue") or payload.get("selected_actions") or []
+
+    if not isinstance(candidates, list):
+        return []
+
+    queue: list[dict[str, Any]] = []
+    for item in candidates:
+        if isinstance(item, dict):
+            normalized: dict[str, Any] = {}
+            for key in ("id", "action", "priority", "reason"):
+                if key in item:
+                    normalized[key] = item[key]
+            if "id" in normalized:
+                try:
+                    normalized["id"] = int(normalized["id"])
+                except (TypeError, ValueError):
+                    continue
+            if "priority" in normalized:
+                try:
+                    normalized["priority"] = int(normalized["priority"])
+                except (TypeError, ValueError):
+                    normalized["priority"] = 0
+            queue.append(normalized)
+        else:
+            try:
+                queue.append({"id": int(item), "action": "click", "priority": 0, "reason": ""})
+            except (TypeError, ValueError):
+                continue
+
+    queue.sort(key=lambda row: int(row.get("priority", 0)))
+    return queue
 
 
 def _normalize_url_value(url: str) -> str:
@@ -322,6 +358,50 @@ def select_relevant_urls(sitemap: list[dict[str, Any]], user_query: str) -> list
     """Backward-compatible wrapper for older callers."""
 
     return select_winning_paths(sitemap, user_query)
+
+
+def evaluate_traversal_path(
+    user_query: str,
+    page_snippet: str,
+    discovered_elements: list[dict[str, Any]],
+    logic_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Use Groq Llama 3.1 70B to classify a page and rank the next navigation actions."""
+
+    print("[groq_client] evaluate_traversal_path called")
+    navigator_model = str(os.getenv("GROQ_NAVIGATOR_MODEL", "llama-3.3-70b-versatile")).strip() or "llama-3.3-70b-versatile"
+    prompt = build_navigation_prompt(
+        user_query=user_query,
+        page_snippet=page_snippet,
+        discovered_elements=discovered_elements,
+        result_limit=max(1, min(int((logic_metadata or {}).get("result_limit", 10) or 10), 20)),
+    )
+
+    try:
+        parsed = _call_groq_json(prompt, model=navigator_model)
+        if not isinstance(parsed, dict):
+            raise ValueError("Traversal response JSON is not an object")
+
+        decision = str(parsed.get("decision", "continue")).strip().lower()
+        if decision not in {"extract", "continue", "backtrack"}:
+            decision = "continue"
+
+        terminal_page = bool(parsed.get("terminal_page", decision == "extract"))
+        priority_queue = _coerce_priority_queue(parsed)
+
+        return {
+            "decision": decision,
+            "terminal_page": terminal_page,
+            "reason": str(parsed.get("reason", "")).strip(),
+            "priority_queue": priority_queue,
+            "raw": parsed,
+        }
+    except Exception as exc:
+        error_msg = f"{type(exc).__name__}: {exc}"
+        print(f"[groq_client] Traversal evaluation failed: {error_msg}")
+        raise RuntimeError(
+            f"Groq traversal evaluation failed. Is GROQ_API_KEY configured? Error: {error_msg}"
+        )
 
 
 def extract_structured_json(page_markdown: str, extraction_goal: str) -> dict[str, Any]:

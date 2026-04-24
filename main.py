@@ -5,13 +5,12 @@ from __future__ import annotations
 import os
 import re
 from typing import Any
-from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-from ai.groq_client import extract_structured_json, select_winning_paths
+from ai.groq_client import extract_structured_json
 from scraper.engine import crawl_site, execute_selector_extraction
 
 load_dotenv()
@@ -26,8 +25,7 @@ st.caption("Scrape dynamic sites, clean the page, and structure results powered 
 
 with st.sidebar:
     st.header("Scraping Settings")
-    max_depth = st.slider("Crawl depth", min_value=1, max_value=5, value=3)
-    max_links = st.slider("Max discovered links", min_value=10, max_value=200, value=100, step=10)
+    navigation_limit = st.number_input("Global navigation limit", min_value=1, max_value=200, value=50, step=1)
 
 url = st.text_input("Target URL", placeholder="https://example.com")
 target_selector = st.text_input(
@@ -149,62 +147,6 @@ def _extract_requested_count(extraction_goal: str, default_count: int = 3) -> in
     return max(1, min(value, 10))
 
 
-def _build_sitemap_lookup(sitemap: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    lookup: dict[str, dict[str, Any]] = {}
-    for row in sitemap:
-        if not isinstance(row, dict):
-            continue
-        row_url = _normalize_url_value(row.get("url"))
-        if not row_url or row_url in lookup:
-            continue
-        lookup[row_url] = row
-    return lookup
-
-
-def _backfill_missing_records(
-    records: list[dict[str, Any]],
-    selected_urls: list[str],
-    sitemap_lookup: dict[str, dict[str, Any]],
-    target_count: int,
-) -> list[dict[str, Any]]:
-    if target_count <= 0:
-        return records
-
-    result = list(records)
-    existing_urls = {
-        _normalize_url_value(record.get("url"))
-        for record in result
-        if isinstance(record, dict) and _normalize_url_value(record.get("url"))
-    }
-
-    for raw_url in selected_urls:
-        if len(result) >= target_count:
-            break
-
-        selected_url = _normalize_url_value(raw_url)
-        if not selected_url or selected_url in existing_urls:
-            continue
-
-        metadata = sitemap_lookup.get(selected_url, {})
-        anchor_text = str(metadata.get("anchor_text", "")).strip()
-        parent_context = str(metadata.get("parent_context", "")).strip()
-
-        headline = anchor_text or selected_url.rsplit("/", maxsplit=1)[-1].replace("-", " ").strip() or "Untitled"
-        summary = parent_context or "No grounded summary could be extracted from the selected page content."
-
-        result.append(
-            {
-                "headline": headline,
-                "url": selected_url,
-                "summary": summary,
-                "source": "metadata_fallback",
-            }
-        )
-        existing_urls.add(selected_url)
-
-    return result
-
-
 def _extract_focus_terms(extraction_goal: str) -> list[str]:
     text = str(extraction_goal or "")
     quoted_groups = re.findall(r"'([^']+)'|\"([^\"]+)\"", text)
@@ -272,33 +214,6 @@ def _filter_relevant_records(records: list[dict[str, Any]], extraction_goal: str
     return [record for record in records if isinstance(record, dict) and _is_record_relevant(record, focus_terms)]
 
 
-def _build_seed_urls(base_url: str) -> list[str]:
-    normalized_base = str(base_url or "").strip()
-    if not normalized_base:
-        return []
-
-    parsed = urlparse(normalized_base)
-    if not parsed.scheme:
-        normalized_base = f"https://{normalized_base}"
-
-    seeds = [
-        normalized_base,
-        urljoin(normalized_base, "/news"),
-        urljoin(normalized_base, "/news/technology"),
-        urljoin(normalized_base, "/news/science-environment"),
-        urljoin(normalized_base, "/news/climate"),
-    ]
-
-    unique: list[str] = []
-    seen: set[str] = set()
-    for seed in seeds:
-        value = _normalize_url_value(seed)
-        if value and value not in seen:
-            seen.add(value)
-            unique.append(value)
-    return unique
-
-
 def _fallback_select_urls(
     sitemap: list[dict[str, Any]], extraction_goal: str, target_count: int
 ) -> list[str]:
@@ -346,7 +261,7 @@ def _fallback_select_urls(
 if run_button:
     print("[main] Run button clicked")
     print(
-        f"[main] Inputs received: max_depth={max_depth}, max_links={max_links}, url_present={bool(url)}, "
+        f"[main] Inputs received: navigation_limit={navigation_limit}, url_present={bool(url)}, "
         f"extraction_goal_present={bool(extraction_goal)}"
     )
     if not url or not extraction_goal:
@@ -357,36 +272,62 @@ if run_button:
             requested_count = _extract_requested_count(extraction_goal, default_count=3)
             print(f"[main] Parsed requested_count={requested_count}")
 
-            print("[main] Starting discovery phase")
-            with st.spinner("Step 1 of 4: Discovering site frontier..."):
-                sitemap = crawl_site(url, max_depth=max_depth, max_links=max_links)
+            print("[main] Starting autonomous navigation phase")
+            with st.spinner("Step 1 of 4: Discovering relevant paths with DFS..."):
+                navigation_trace = crawl_site(
+                    url,
+                    extraction_goal=extraction_goal,
+                    result_limit=requested_count,
+                    global_page_limit=int(navigation_limit),
+                )
 
-            if not sitemap:
-                seed_urls = _build_seed_urls(url)
-                sitemap = [
-                    {
-                        "url": seed_url,
-                        "anchor_text": "seed fallback",
-                        "parent_context": "generated fallback path when crawler returned no links",
-                    }
-                    for seed_url in seed_urls
-                ]
-                st.warning("Discovery returned no links; using fallback site sections for routing.")
+            visited_pages = navigation_trace.get("visited_pages", []) if isinstance(navigation_trace, dict) else []
+            terminal_pages = navigation_trace.get("terminal_pages", []) if isinstance(navigation_trace, dict) else []
+            seed_urls = navigation_trace.get("seed_urls", []) if isinstance(navigation_trace, dict) else []
 
-            print(f"[main] Discovery complete: sitemap_count={len(sitemap)}")
-            st.success(f"Discovery complete. Frontier links found: {len(sitemap)}")
+            print(
+                f"[main] Navigation complete: visited_pages={len(visited_pages)}, terminal_pages={len(terminal_pages)}"
+            )
+            st.success(
+                f"Navigation complete. Pages visited: {len(visited_pages)}. Terminal pages found: {len(terminal_pages)}"
+            )
 
-            print("[main] Starting routing phase")
-            with st.spinner("Step 2 of 4: Ranking the most relevant paths..."):
-                selected_urls = select_winning_paths(sitemap, extraction_goal, target_count=requested_count)
-
+            selected_urls = [str(item).strip() for item in dict.fromkeys(terminal_pages) if str(item).strip()]
             if not selected_urls:
-                selected_urls = _fallback_select_urls(sitemap, extraction_goal, requested_count)
-                if selected_urls:
-                    st.warning("Router returned no links; using deterministic relevance fallback.")
+                diagnostics = {
+                    "requested_count": requested_count,
+                    "selected_url_count": 0,
+                    "successful_source_count": 0,
+                    "raw_extracted_count": 0,
+                    "after_logic_count": 0,
+                    "after_grounding_count": 0,
+                    "after_relevance_count": 0,
+                    "final_count": 0,
+                    "dropped_count": 0,
+                    "backfilled_count": 0,
+                    "pages_visited": len(visited_pages),
+                    "terminal_pages": len(terminal_pages),
+                }
+                final_payload = {
+                    "success": True,
+                    "records": [],
+                    "logic_metadata": {},
+                    "selected_urls": [],
+                    "navigation_trace": navigation_trace,
+                    "diagnostics": diagnostics,
+                }
+                st.warning("Navigator did not identify a terminal page containing the target data.")
+                _render_json_payload(final_payload)
+                with st.expander("Run Diagnostics"):
+                    st.json(diagnostics)
+                print("[main] Navigation ended without terminal pages; returned empty payload")
+                st.stop()
 
-            print(f"[main] Routing complete: selected_url_count={len(selected_urls)}")
-            st.success(f"Routing complete. Selected paths: {len(selected_urls)}")
+            if len(selected_urls) > requested_count:
+                selected_urls = selected_urls[:requested_count]
+
+            print(f"[main] Terminal selection complete: selected_url_count={len(selected_urls)}")
+            st.success(f"Selected terminal pages: {len(selected_urls)}")
 
             if not selected_urls:
                 diagnostics = {
@@ -420,7 +361,7 @@ if run_button:
             successful_sources: list[str] = []
             selector_list = [target_selector] if target_selector.strip() else ["main", "article", "[role='main']", "body"]
 
-            with st.spinner("Step 3 of 4: Scraping selected pages..."):
+            with st.spinner("Step 2 of 4: Scraping selected terminal pages..."):
                 for index, selected_url in enumerate(selected_urls, start=1):
                     print(f"[main] Scraping selected URL {index}/{len(selected_urls)}: {selected_url}")
                     try:
@@ -452,7 +393,7 @@ if run_button:
             )
 
             print("[main] Starting Groq extraction phase")
-            with st.spinner("Step 4 of 4: Extracting structured data with Groq LPU..."):
+            with st.spinner("Step 3 of 4: Extracting structured data with Groq LPU..."):
                 extracted = extract_structured_json(
                     page_markdown=combined_markdown,
                     extraction_goal=extraction_goal,
@@ -469,9 +410,10 @@ if run_button:
             )
             allowed_urls = {
                 _normalize_url_value(item.get("url"))
-                for item in sitemap
+                for item in visited_pages
                 if isinstance(item, dict) and _normalize_url_value(item.get("url"))
             }
+            allowed_urls.update(_normalize_url_value(item) for item in seed_urls if _normalize_url_value(item))
             allowed_urls.update(_normalize_url_value(item) for item in selected_urls if _normalize_url_value(item))
             allowed_urls.add(_normalize_url_value(url))
             records_after_grounding = _ground_and_dedupe_records(records_after_logic, allowed_urls)
@@ -489,12 +431,15 @@ if run_button:
                 "final_count": len(filtered_records),
                 "dropped_count": max(0, len(records_after_logic) - len(records_after_grounding)),
                 "backfilled_count": 0,
+                "pages_visited": len(visited_pages),
+                "terminal_pages": len(terminal_pages),
             }
 
             final_payload = {
                 **extracted,
                 "records": filtered_records,
                 "selected_urls": successful_sources,
+                "navigation_trace": navigation_trace,
                 "diagnostics": diagnostics,
             }
 
