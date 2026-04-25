@@ -10,7 +10,12 @@ from typing import Any
 
 from groq import Groq  # type: ignore[import-not-found]
 
-from ai.prompt_builder import build_extraction_prompt, build_navigation_prompt, build_router_prompt
+from ai.prompt_builder import (
+    build_extraction_prompt,
+    build_navigation_prompt,
+    build_router_prompt,
+    build_vision_navigation_prompt,
+)
 
 
 def _get_client() -> Groq:
@@ -24,10 +29,36 @@ def _chunk_text(text: str, chunk_size: int) -> list[str]:
     return [text[index : index + chunk_size] for index in range(0, len(text), chunk_size)]
 
 
+def _extract_json_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                chunks.append(str(item.get("text", "")))
+        return "\n".join(chunks)
+    return "{}"
+
+
+def _extract_json_object_from_text(text: str) -> Any:
+    raw = str(text or "").strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        match = re.search(r"\{[\s\S]*\}", raw)
+        if not match:
+            raise
+        return json.loads(match.group(0))
+
+
 def _parse_json_content(response: Any) -> Any:
     message = response.choices[0].message if getattr(response, "choices", None) else None
-    response_text = getattr(message, "content", None) or "{}"
-    return json.loads(response_text)
+    response_content = getattr(message, "content", None)
+    response_text = _extract_json_text(response_content)
+    return _extract_json_object_from_text(response_text)
 
 
 def _unique_urls(urls: list[str]) -> list[str]:
@@ -364,20 +395,37 @@ def evaluate_traversal_path(
     user_query: str,
     page_snippet: str,
     discovered_elements: list[dict[str, Any]],
+    screenshot_b64: str = "",
+    sitemap_tree_branch: dict[str, Any] | None = None,
     logic_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Use Groq Llama 3.1 70B to classify a page and rank the next navigation actions."""
+    """Classify a page and rank next navigation actions using the navigator model."""
 
     print("[groq_client] evaluate_traversal_path called")
+    result_limit = max(1, min(int((logic_metadata or {}).get("result_limit", 10) or 10), 20))
     navigator_model = str(os.getenv("GROQ_NAVIGATOR_MODEL", "llama-3.3-70b-versatile")).strip() or "llama-3.3-70b-versatile"
-    prompt = build_navigation_prompt(
-        user_query=user_query,
-        page_snippet=page_snippet,
-        discovered_elements=discovered_elements,
-        result_limit=max(1, min(int((logic_metadata or {}).get("result_limit", 10) or 10), 20)),
-    )
+    use_vision = bool(str(screenshot_b64 or "").strip())
+
+    if use_vision:
+        prompt = build_vision_navigation_prompt(
+            user_query=user_query,
+            page_snippet=page_snippet,
+            discovered_elements=discovered_elements,
+            sitemap_tree_branch=sitemap_tree_branch or {},
+            image_base64=screenshot_b64,
+            result_limit=result_limit,
+        )
+    else:
+        prompt = build_navigation_prompt(
+            user_query=user_query,
+            page_snippet=page_snippet,
+            discovered_elements=discovered_elements,
+            result_limit=result_limit,
+        )
 
     try:
+        # Keep screenshot-aware planning in prompt context while using a stable text model.
+        # This avoids 400 errors from deprecated/unsupported vision endpoints.
         parsed = _call_groq_json(prompt, model=navigator_model)
         if not isinstance(parsed, dict):
             raise ValueError("Traversal response JSON is not an object")

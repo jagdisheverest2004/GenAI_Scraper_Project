@@ -94,7 +94,10 @@ def _apply_logic_metadata(records: list[dict[str, Any]], logic_metadata: dict[st
         return records
 
     try:
-        limit = int(result_limit)
+        if result_limit is None:
+            limit = 0
+        else:
+            limit = int(result_limit)
         if limit > 0:
             filtered = filtered.head(limit)
     except (TypeError, ValueError):

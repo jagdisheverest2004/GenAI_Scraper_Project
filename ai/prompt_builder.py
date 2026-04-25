@@ -101,6 +101,76 @@ def build_navigation_prompt(
         return prompt
 
 
+def build_vision_navigation_prompt(
+    user_query: str,
+    page_snippet: str,
+    discovered_elements: list[dict[str, object]],
+    sitemap_tree_branch: dict[str, object],
+    image_base64: str,
+    result_limit: int = 10,
+) -> str:
+    """Build a vision-first pathfinder prompt that uses screenshot + sitemap branch context."""
+
+    branch_children = (sitemap_tree_branch or {}).get("children", {}) if isinstance(sitemap_tree_branch, dict) else {}
+    print(
+        f"[prompt_builder] Building vision navigation prompt: user_query_len={len(user_query.strip())}, "
+        f"snippet_len={len(page_snippet.strip())}, element_count={len(discovered_elements)}, "
+        f"branch_children={len(branch_children) if isinstance(branch_children, dict) else 0}, "
+        f"image_len={len(image_base64.strip())}, result_limit={result_limit}"
+    )
+    prompt = dedent(
+        f"""
+        You are Pathfinder-Vision, an autonomous web navigation agent.
+
+        User Query:
+        {user_query.strip()}
+
+        Current Page Snippet:
+        {page_snippet.strip()}
+
+        Current Sitemap Tree Branch:
+        {json.dumps(sitemap_tree_branch or {}, ensure_ascii=False)}
+
+        Discovered Elements:
+        {json.dumps(discovered_elements, ensure_ascii=False)}
+
+        Image Context:
+        - A full-page screenshot was captured for this page and provided as base64 context metadata.
+        - image_base64_length={len(image_base64.strip())}
+
+        Instructions:
+        - Use both the screenshot and page snippet to infer the true visual navigation affordances.
+        - Use the sitemap tree branch to choose the shortest path to pages likely containing the target data.
+        - If a clear search input appears in the screenshot, prioritize typing the goal fields and submitting Enter.
+        - Decide whether this page is a Terminal Page (data is present), Intermediate Page (good path), or Dead End.
+        - Rank only the provided discovered element ids.
+        - You may choose action=navigate only for sitemap-node elements with href.
+        - For search interactions, use action=type (engine will type goal fields and submit Enter).
+        - Return strict JSON only.
+
+        Required JSON shape:
+        {{
+            "decision": "extract|continue|backtrack",
+            "terminal_page": true,
+            "reason": "short explanation",
+            "priority_queue": [
+            {{
+                "id": 3,
+                "action": "click|type|submit|inspect|navigate",
+                "priority": 1,
+                "reason": "why this element is promising"
+            }}
+            ]
+        }}
+
+        Return no more than {result_limit} queue items.
+        Return ONLY valid JSON.
+        """
+    ).strip()
+    print(f"[prompt_builder] Vision navigation prompt built: prompt_len={len(prompt)}")
+    return prompt
+
+
 def build_extraction_prompt(extraction_goal: str, page_markdown: str) -> str:
     """Build a strict extraction prompt for Groq-driven chunk loops."""
 

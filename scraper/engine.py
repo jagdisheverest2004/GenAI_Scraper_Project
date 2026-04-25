@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 from dataclasses import dataclass
 import sys
@@ -69,9 +70,9 @@ class DeepDiscoveryCrawler:
         )
         return str(snippet or "")[:limit]
 
-    def _fetch_sitemap_urls(self, start_url: str) -> list[str]:
-        """Recursively parse sitemaps to find HTML URLs, avoiding XML navigation in browser."""
-        discovered_urls = []
+    def _fetch_sitemap_urls(self, start_url: str) -> dict[str, Any]:
+        """Recursively parse sitemaps and return a hierarchical tree of discovered HTML URLs."""
+        discovered_urls: list[str] = []
         to_process = [urljoin(start_url, "/sitemap.xml")]
         processed_xmls = set()
 
@@ -109,8 +110,126 @@ class DeepDiscoveryCrawler:
             except Exception as e:
                 print(f"[engine] Sitemap processing skipped for {current_xml}: {e}")
 
+        sitemap_tree = self._build_sitemap_tree(start_url, discovered_urls)
         print(f"[engine] Sitemap crawl complete. Found {len(discovered_urls)} HTML URLs.")
-        return discovered_urls
+        return sitemap_tree
+
+    def _build_sitemap_tree(self, root_url: str, urls: list[str]) -> dict[str, Any]:
+        root = {
+            "url": self._normalize_root_url(root_url),
+            "segment": "/",
+            "children": {},
+            "is_page": True,
+        }
+        for page_url in urls:
+            normalized = self._normalize_root_url(page_url)
+            parsed = urlparse(normalized)
+            parts = [part for part in parsed.path.split("/") if part]
+            if not parts:
+                continue
+
+            cursor = root
+            current_path = ""
+            for part in parts:
+                current_path = f"{current_path}/{part}" if current_path else f"/{part}"
+                node = cursor["children"].setdefault(
+                    part,
+                    {
+                        "url": urlunparse(parsed._replace(path=current_path, query="", fragment="")),
+                        "segment": part,
+                        "children": {},
+                        "is_page": False,
+                    },
+                )
+                cursor = node
+            cursor["is_page"] = True
+        return root
+
+    def _flatten_sitemap_tree(self, sitemap_tree: dict[str, Any]) -> list[str]:
+        urls: list[str] = []
+
+        def _walk(node: dict[str, Any]) -> None:
+            node_url = str(node.get("url", "")).strip()
+            if node_url and node.get("is_page"):
+                urls.append(node_url)
+            children = node.get("children") or {}
+            for child in children.values():
+                if isinstance(child, dict):
+                    _walk(child)
+
+        _walk(sitemap_tree)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for url in urls:
+            if url and url not in seen:
+                seen.add(url)
+                deduped.append(url)
+        return deduped
+
+    def _find_sitemap_branch(self, sitemap_tree: dict[str, Any], current_url: str) -> dict[str, Any]:
+        normalized = self._normalize_root_url(current_url)
+        parsed = urlparse(normalized)
+        parts = [part for part in parsed.path.split("/") if part]
+
+        cursor = sitemap_tree
+        for part in parts:
+            children = cursor.get("children") or {}
+            next_node = children.get(part)
+            if not isinstance(next_node, dict):
+                break
+            cursor = next_node
+        return cursor
+
+    def _build_sitemap_branch_candidates(
+        self,
+        sitemap_branch: dict[str, Any],
+        extraction_goal: str,
+        starting_id: int,
+    ) -> list[dict[str, Any]]:
+        children = sitemap_branch.get("children") or {}
+        focus_terms = {token.lower() for token in str(extraction_goal or "").split() if len(token) > 2}
+        candidates: list[dict[str, Any]] = []
+
+        next_id = starting_id
+        for segment, node in children.items():
+            if not isinstance(node, dict):
+                continue
+            node_url = str(node.get("url", "")).strip()
+            if not node_url:
+                continue
+
+            haystack = f"{segment} {node_url}".lower()
+            semantic_score = sum(1 for term in focus_terms if term in haystack)
+            candidates.append(
+                {
+                    "id": next_id,
+                    "kind": "sitemap-node",
+                    "text": str(segment).strip()[:200],
+                    "label": str(segment).replace("-", " ").replace("_", " ").strip()[:200],
+                    "href": node_url,
+                    "placeholder": "",
+                    "title": "",
+                    "type": "",
+                    "name": "",
+                    "role": "",
+                    "parent_class": "",
+                    "parent_text": "",
+                    "semantic_score": semantic_score,
+                    "signature": self._hash_signature("sitemap", node_url),
+                }
+            )
+            next_id += 1
+        return candidates
+
+    def _capture_screenshot_b64(self, page) -> str:
+        try:
+            screenshot_bytes = page.screenshot(full_page=True)
+            if not screenshot_bytes:
+                return ""
+            return base64.b64encode(screenshot_bytes).decode("utf-8")
+        except Exception as e:
+            print(f"[engine] Screenshot capture failed: {e}")
+            return ""
 
     def _normalize_url(self, source_url: str, href: str) -> str | None:
         href = str(href or "").strip()
@@ -171,23 +290,51 @@ class DeepDiscoveryCrawler:
             })
         return discovered
 
-    def _evaluate_current_page(self, extraction_goal: str, page_snippet: str, discovered_elements: list[dict[str, Any]], result_limit: int) -> dict[str, Any]:
-        return evaluate_traversal_path(user_query=extraction_goal, page_snippet=page_snippet, discovered_elements=discovered_elements, logic_metadata={"result_limit": result_limit})
+    def _evaluate_current_page(
+        self,
+        extraction_goal: str,
+        page_snippet: str,
+        discovered_elements: list[dict[str, Any]],
+        result_limit: int,
+        screenshot_b64: str,
+        sitemap_tree_branch: dict[str, Any],
+    ) -> dict[str, Any]:
+        return evaluate_traversal_path(
+            user_query=extraction_goal,
+            page_snippet=page_snippet,
+            discovered_elements=discovered_elements,
+            screenshot_b64=screenshot_b64,
+            sitemap_tree_branch=sitemap_tree_branch,
+            logic_metadata={"result_limit": result_limit},
+        )
 
-    def _try_execute_navigation_action(self, page, page_url: str, element: dict[str, Any], extraction_goal: str) -> str | None:
+    def _try_execute_navigation_action(
+        self,
+        page,
+        page_url: str,
+        element: dict[str, Any],
+        extraction_goal: str,
+        action: str = "click",
+    ) -> str | None:
         kind = str(element.get("kind", "")).lower()
         label = str(element.get("label") or element.get("text") or "").strip()
         href = str(element.get("href", "")).strip()
         text = str(element.get("text", "")).strip()
+        requested_action = str(action or "click").lower()
+        goal_fields = " ".join([t for t in str(extraction_goal or "").split() if len(t) > 1][:8])
 
         try:
-            if kind == "search-input":
-                search_text = " ".join([t for t in str(extraction_goal or "").split() if len(t) > 2][:5])
-                locator = page.locator("input[type='search']").first
-                locator.fill(search_text)
+            if kind in {"search-input", "input"} or requested_action in {"type", "submit"}:
+                locator = page.locator("input[type='search'], input[role='searchbox'], input[placeholder*='search' i]").first
+                if locator.count() == 0 and label:
+                    locator = page.get_by_role("textbox", name=label).first
+                locator.click()
+                locator.fill(goal_fields)
                 locator.press("Enter")
                 page.wait_for_load_state("domcontentloaded", timeout=10000)
                 return page.url
+            if requested_action == "navigate" and href:
+                return self._normalize_root_url(href)
             if href:
                 locator = page.get_by_role("link", name=label or text).first
                 if locator.count() == 0:
@@ -208,8 +355,10 @@ class DeepDiscoveryCrawler:
         _ensure_windows_proactor_policy()
         stealth = Stealth()
 
-        # Seed with homepage first, then sitemaps to ensure interactive discovery
-        sitemap_urls = self._fetch_sitemap_urls(start_url)
+        # Seed with homepage first, then tree paths from sitemap when available.
+        sitemap_tree = self._fetch_sitemap_urls(start_url)
+        sitemap_urls = self._flatten_sitemap_tree(sitemap_tree)
+        has_sitemap = bool(sitemap_urls)
         frontier = [start_url] + [url for url in reversed(sitemap_urls) if url != start_url]
         
         visited_elements: set[str] = set()
@@ -241,6 +390,17 @@ class DeepDiscoveryCrawler:
                 # OPTIMIZED CODE
                 page_snippet = self._extract_context_snippet(page)
                 discovered_elements = self._discover_navigation_elements(page, current_url, extraction_goal)
+                screenshot_b64 = self._capture_screenshot_b64(page)
+                current_sitemap_branch = self._find_sitemap_branch(sitemap_tree, current_url) if has_sitemap else {}
+
+                # Merge current branch candidates from sitemap tree so model can choose shortest URL hops.
+                if has_sitemap:
+                    sitemap_candidates = self._build_sitemap_branch_candidates(
+                        current_sitemap_branch,
+                        extraction_goal,
+                        starting_id=len(discovered_elements) + 1,
+                    )
+                    discovered_elements.extend(sitemap_candidates)
 
                 # --- NEW: Semantic Pre-Filtering ---
                 # Sort elements by semantic_score (highest first) and take the top 20.
@@ -252,7 +412,14 @@ class DeepDiscoveryCrawler:
                 )[:20] 
 
                 # Pass the smaller, high-quality list to the LLM
-                evaluation = self._evaluate_current_page(extraction_goal, page_snippet, filtered_elements, result_limit)
+                evaluation = self._evaluate_current_page(
+                    extraction_goal,
+                    page_snippet,
+                    filtered_elements,
+                    result_limit,
+                    screenshot_b64,
+                    current_sitemap_branch,
+                )
                 # ------------------------------------
 
                 page_record = {
@@ -274,13 +441,33 @@ class DeepDiscoveryCrawler:
                     matching_element = next((item for item in discovered_elements if item.get("id") == int(candidate.get("id", -1))), None)
                     if matching_element and matching_element.get("signature") not in visited_elements:
                         visited_elements.add(matching_element["signature"])
-                        next_url = self._try_execute_navigation_action(page, current_url, matching_element, extraction_goal)
+                        next_url = self._try_execute_navigation_action(
+                            page,
+                            current_url,
+                            matching_element,
+                            extraction_goal,
+                            action=str(candidate.get("action", "click")),
+                        )
                         if next_url:
                             norm_next = self._normalize_root_url(next_url)
                             if self._hash_signature("url", norm_next) not in visited_elements:
                                 frontier.append(norm_next)
                                 moved = True
                                 break
+                if not moved and has_sitemap:
+                    # If no actionable DOM element succeeds, continue with sitemap tree fallback navigation.
+                    branch_children = (current_sitemap_branch.get("children") or {}) if isinstance(current_sitemap_branch, dict) else {}
+                    for node in branch_children.values():
+                        if not isinstance(node, dict):
+                            continue
+                        candidate_url = self._normalize_root_url(str(node.get("url", "")))
+                        if not candidate_url:
+                            continue
+                        if self._hash_signature("url", candidate_url) in visited_elements:
+                            continue
+                        frontier.append(candidate_url)
+                        moved = True
+                        break
                 if not moved:
                     dead_end_pages.append(current_url)
 
@@ -288,6 +475,7 @@ class DeepDiscoveryCrawler:
 
         return {
             "start_url": start_url,
+            "sitemap_tree": sitemap_tree,
             "visited_pages": visited_pages,
             "terminal_pages": terminal_pages,
             "pages_visited": len(visited_pages),
@@ -330,7 +518,7 @@ def crawl_site(base_url: str, max_depth: int = 3, max_links: int = 100, extracti
 def execute_selector_extraction(url: str, selectors: list[str]) -> dict[str, str]:
     return DeepDiscoveryCrawler(url).execute_selector_extraction(url, selectors)
 
-def scrape_url(url: str, strategy: ScrapeStrategy = "single", max_pages: int = 3, max_scrolls: int = 3, target_selector: str = None) -> ScrapeResult:
+def scrape_url(url: str, strategy: ScrapeStrategy = "single", max_pages: int = 3, max_scrolls: int = 3, target_selector: str | None = None) -> ScrapeResult:
     _ensure_windows_proactor_policy()
     stealth = Stealth()
     with sync_playwright() as playwright:

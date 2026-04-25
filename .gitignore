@@ -1,1 +1,4 @@
 .env 
+.vev
+/ai/__pycache__/
+/scraper/__pycache__/
