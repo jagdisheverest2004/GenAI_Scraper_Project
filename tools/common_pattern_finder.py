@@ -36,53 +36,82 @@ def find_common_patterns(start_url: str, goal: str, max_pages: int = 50) -> str:
             page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(2000) # Wait for dynamic rendering
             
-            content = page.content()
-            soup = BeautifulSoup(content, "html.parser")
+            recipe = None
+            navigation_steps = 0
             
-            # Clean HTML to fit in prompt token limits
-            for tag in soup(["script", "style", "svg", "noscript", "meta", "head"]):
-                tag.decompose()
-            
-            # Convert body to string for LLM analysis
-            html_snippet = soup.prettify()[:15000] # Provide a large chunk of the DOM
-            
-            prompt = f"""
-            Goal: {goal}
-            Analyze the following HTML structure to find the repeating items (like books, products, or news articles) that match the Goal.
+            while navigation_steps < 3:
+                content = page.content()
+                soup = BeautifulSoup(content, "html.parser")
+                
+                # Clean HTML to fit in prompt token limits
+                for tag in soup(["script", "style", "svg", "noscript", "meta", "head"]):
+                    tag.decompose()
+                
+                # Convert body to string for LLM analysis
+                html_snippet = soup.prettify()[:15000] # Provide a large chunk of the DOM
+                
+                prompt = f"""
+                Goal: {goal}
+                Analyze the following HTML structure. Determine if the repeating items (like books, products, or news articles) that match the Goal are on this page, or if we need to click a link to navigate to a different section (like a 'News', 'Blog', or 'Products' page).
+                
+                If the repeating items ARE NOT on this page, but there is a navigation link that leads to them, return a JSON:
+                {{
+                    "action": "navigate",
+                    "link_selector": "Valid CSS selector or Playwright selector for the link to click (e.g., 'nav a:has-text(\\"News\\")')"
+                }}
+                
+                If the repeating items ARE on this page, return a JSON to extract them:
+                {{
+                    "action": "extract",
+                    "container_selector": "The CSS selector for the main repeating element (e.g., 'li.product', 'article.product_pod', 'div.card')",
+                    "fields": {{
+                        "field_name_1": {{"selector": "relative css selector inside container", "attr": "text" or "href" or "title" or "src"}},
+                        "field_name_2": {{"selector": "...", "attr": "..."}}
+                    }},
+                    "next_page_selector": "The CSS selector for the 'Next' pagination link (e.g., 'li.next a', 'a.next-page'). If there is no pagination, return null."
+                }}
+                
+                HTML Snippet:
+                {html_snippet}
+                """
+                
+                print("[MCP TOOL: Common Finder] Asking LLM to analyze page and generate action...")
+                response = groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    response_format={"type": "json_object"}
+                )
+                
+                current_recipe = json.loads(response.choices[0].message.content)
+                print(f"[MCP TOOL: Common Finder] LLM Action: {json.dumps(current_recipe, indent=2)}")
+                
+                if current_recipe.get("action") == "navigate":
+                    link_sel = current_recipe.get("link_selector")
+                    if link_sel:
+                        print(f"[MCP TOOL: Common Finder] Navigating to {link_sel}...")
+                        try:
+                            link_el = page.locator(link_sel).first
+                            link_el.scroll_into_view_if_needed(timeout=5000)
+                            link_el.click(force=True, timeout=5000)
+                            page.wait_for_load_state("domcontentloaded", timeout=15000)
+                            page.wait_for_timeout(2000)
+                            navigation_steps += 1
+                            continue
+                        except Exception as e:
+                            print(f"[MCP TOOL: Common Finder] Failed to click navigation link: {e}")
+                            recipe = current_recipe
+                            break
+                    else:
+                        recipe = current_recipe
+                        break
+                else:
+                    recipe = current_recipe
+                    break
 
-            Instead of extracting the data yourself, you must write a JSON configuration that a Python BeautifulSoup scraper can use to extract the data rapidly from this page and all subsequent paginated pages.
+            if not recipe:
+                recipe = current_recipe
 
-            Return a JSON with the following structure:
-            {{
-                "container_selector": "The CSS selector for the main repeating element (e.g., 'li.product', 'article.product_pod', 'div.card')",
-                "fields": {{
-                    "field_name_1": {{"selector": "relative css selector inside container", "attr": "text" or "href" or "title" or "src"}},
-                    "field_name_2": {{"selector": "...", "attr": "..."}}
-                }},
-                "next_page_selector": "The CSS selector for the 'Next' pagination link (e.g., 'li.next a', 'a.next-page'). If there is no pagination, return null."
-            }}
-
-            For example, to extract a book's title and price from <article class="product_pod">, the fields might be:
-            "fields": {{
-                "title": {{"selector": "h3 a", "attr": "title"}},
-                "price": {{"selector": "p.price_color", "attr": "text"}}
-            }}
-
-            HTML Snippet:
-            {html_snippet}
-            """
-            
-            print("[MCP TOOL: Common Finder] Asking LLM to generate extraction recipe...")
-            response = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                response_format={"type": "json_object"}
-            )
-            
-            recipe = json.loads(response.choices[0].message.content)
-            print(f"[MCP TOOL: Common Finder] LLM Recipe: {json.dumps(recipe, indent=2)}")
-            
             container_sel = recipe.get("container_selector")
             fields_map = recipe.get("fields", {})
             next_sel = recipe.get("next_page_selector")
