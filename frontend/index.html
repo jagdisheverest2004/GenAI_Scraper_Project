@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>MCP AI Web Scraper</title>
+  <meta name="description" content="Intelligent AI-powered web scraper using an Orchestrated 2-Agent Pipeline to extract structured and factual data from any website."/>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #070d1a;
+      --surface: #0f172a;
+      --card: #1e2a3d;
+      --border: #1e3a5f;
+      --accent: #38bdf8;
+      --accent2: #818cf8;
+      --text: #e2e8f0;
+      --muted: #64748b;
+      --success: #10b981;
+      --error: #f43f5e;
+      --radius: 14px;
+      --font: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    }
+
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* Animated background */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background:
+        radial-gradient(ellipse 80% 50% at 20% 10%, rgba(56,189,248,0.07) 0%, transparent 60%),
+        radial-gradient(ellipse 60% 40% at 80% 80%, rgba(129,140,248,0.06) 0%, transparent 60%);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* HEADER */
+    header {
+      position: sticky; top: 0; z-index: 100;
+      background: rgba(7,13,26,0.85);
+      backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 2rem;
+      height: 64px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .logo { display: flex; align-items: center; gap: 10px; }
+    .logo-icon {
+      width: 36px; height: 36px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px;
+    }
+    .logo-text { font-size: 1.1rem; font-weight: 700; letter-spacing: -0.3px; }
+    .logo-text span { color: var(--accent); }
+    .header-badge {
+      font-size: 0.75rem; color: var(--muted); border: 1px solid var(--border);
+      padding: 4px 12px; border-radius: 999px;
+    }
+
+    /* MAIN LAYOUT */
+    main {
+      position: relative; z-index: 1;
+      max-width: 900px; margin: 0 auto;
+      padding: 3rem 1.5rem 4rem;
+    }
+
+    /* HERO */
+    .hero { text-align: center; margin-bottom: 3rem; }
+    .hero h1 {
+      font-size: clamp(2rem, 5vw, 3rem);
+      font-weight: 800; letter-spacing: -1px;
+      background: linear-gradient(135deg, #fff 30%, var(--accent) 100%);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      line-height: 1.15; margin-bottom: 0.75rem;
+    }
+    .hero p { color: var(--muted); font-size: 1.05rem; max-width: 560px; margin: 0 auto; }
+
+    /* FORM CARD */
+    .form-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 2rem;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+    }
+    .form-group { margin-bottom: 1.25rem; }
+    label { display: block; font-size: 0.82rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 0.5rem; }
+    input, textarea {
+      width: 100%; background: var(--card); border: 1px solid var(--border);
+      border-radius: 10px; color: var(--text); font-family: var(--font);
+      font-size: 0.95rem; padding: 0.75rem 1rem; outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    input:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(56,189,248,0.12); }
+    textarea { resize: vertical; min-height: 90px; }
+
+    /* SETTINGS ROW */
+    .settings-row {
+      display: flex; gap: 1rem; align-items: flex-end; margin-bottom: 1.5rem;
+    }
+    .settings-row .form-group { flex: 1; margin-bottom: 0; }
+    .settings-row input[type=number] { max-width: 120px; }
+
+    /* BUTTON */
+    .btn-primary {
+      width: 100%; padding: 0.85rem;
+      background: linear-gradient(135deg, var(--accent) 0%, var(--accent2) 100%);
+      border: none; border-radius: 10px; color: #07111f;
+      font-family: var(--font); font-size: 1rem; font-weight: 700;
+      cursor: pointer; letter-spacing: 0.01em;
+      transition: opacity 0.2s, transform 0.15s, box-shadow 0.2s;
+      box-shadow: 0 4px 24px rgba(56,189,248,0.25);
+    }
+    .btn-primary:hover:not(:disabled) { opacity: 0.9; transform: translateY(-1px); box-shadow: 0 8px 30px rgba(56,189,248,0.35); }
+    .btn-primary:active:not(:disabled) { transform: translateY(0); }
+    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* PROGRESS */
+    .progress-section { margin-top: 2rem; display: none; }
+    .progress-section.visible { display: block; }
+    .progress-label { font-size: 0.85rem; color: var(--muted); margin-bottom: 0.5rem; display: flex; justify-content: space-between; }
+    .progress-bar-wrap { background: var(--card); border-radius: 999px; height: 6px; overflow: hidden; }
+    .progress-bar { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), var(--accent2)); width: 0%; transition: width 0.6s ease; }
+
+    /* STATUS LOG */
+    .status-log {
+      margin-top: 1rem; background: #050a14;
+      border: 1px solid var(--border); border-radius: 10px;
+      padding: 1rem; font-size: 0.8rem; font-family: 'Courier New', monospace;
+      color: #64748b; max-height: 140px; overflow-y: auto;
+      display: none;
+    }
+    .status-log.visible { display: block; }
+    .log-line { margin-bottom: 3px; }
+    .log-line.active { color: var(--accent); }
+    .log-line.done { color: var(--success); }
+
+    /* RESULT SECTION */
+    #result-section { margin-top: 2.5rem; display: none; }
+    #result-section.visible { display: block; }
+
+    .result-header {
+      display: flex; align-items: center; gap: 10px;
+      margin-bottom: 1.25rem;
+    }
+    .result-header h2 { font-size: 1.3rem; font-weight: 700; }
+    .result-badge {
+      font-size: 0.72rem; background: rgba(16,185,129,0.15);
+      color: var(--success); padding: 3px 10px; border-radius: 999px;
+      border: 1px solid rgba(16,185,129,0.3);
+    }
+
+    #result-output {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.5rem;
+      min-height: 120px;
+    }
+
+    /* Raw data toggle */
+    .raw-toggle {
+      margin-top: 1rem;
+      font-size: 0.78rem; color: var(--muted);
+      cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+      user-select: none;
+    }
+    .raw-toggle:hover { color: var(--accent); }
+    #raw-data { display: none; margin-top: 0.75rem; }
+    #raw-data.visible { display: block; }
+    #raw-data pre {
+      background: #050a14; border: 1px solid var(--border);
+      border-radius: 10px; padding: 1rem;
+      font-size: 0.75rem; color: #64748b; overflow-x: auto;
+      max-height: 300px; overflow-y: auto;
+    }
+
+    /* ERROR */
+    .error-box {
+      background: rgba(244,63,94,0.1); border: 1px solid rgba(244,63,94,0.3);
+      border-radius: 10px; padding: 1rem; color: var(--error); font-size: 0.9rem;
+      margin-top: 1.5rem; display: none;
+    }
+    .error-box.visible { display: block; }
+
+    /* FEATURES ROW */
+    .features {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem;
+      margin-top: 3rem;
+    }
+    @media (max-width: 640px) { .features { grid-template-columns: 1fr; } }
+    .feature-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; padding: 1.25rem;
+    }
+    .feature-icon { font-size: 1.4rem; margin-bottom: 0.5rem; }
+    .feature-title { font-size: 0.9rem; font-weight: 600; margin-bottom: 0.25rem; }
+    .feature-desc { font-size: 0.78rem; color: var(--muted); line-height: 1.5; }
+
+    /* Spinner */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner {
+      width: 18px; height: 18px; border: 2px solid rgba(255,255,255,0.2);
+      border-top-color: #fff; border-radius: 50%;
+      animation: spin 0.7s linear infinite; display: inline-block; vertical-align: middle; margin-right: 8px;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">🕵️</div>
+    <div class="logo-text">MCP <span>AI</span> Scraper</div>
+  </div>
+  <div class="header-badge">2-Agent Pipeline</div>
+</header>
+
+<main>
+  <section class="hero">
+    <h1>Intelligent Web Extraction</h1>
+    <p>Powered by an Orchestrated AI pipeline. Extract any data from any website using natural language.</p>
+  </section>
+
+  <div class="form-card">
+    <div class="form-group">
+      <label for="url">Target URL</label>
+      <input type="url" id="url" placeholder="https://example.com" value=""/>
+    </div>
+    <div class="form-group">
+      <label for="query">Extraction Requirement</label>
+      <textarea id="query" placeholder="Find the 3 most recent news articles with title, date and summary…"></textarea>
+    </div>
+
+    <button class="btn-primary" id="scrape-btn" onclick="startScrape()">
+      ⚡ Scrape and Extract
+    </button>
+
+    <!-- Progress -->
+    <div class="progress-section" id="progress-section">
+      <div class="progress-label">
+        <span id="progress-text">Initializing pipeline…</span>
+        <span id="progress-pct">0%</span>
+      </div>
+      <div class="progress-bar-wrap">
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+      <div class="status-log visible" id="status-log"></div>
+    </div>
+  </div>
+
+  <!-- Error -->
+  <div class="error-box" id="error-box"></div>
+
+  <!-- Result -->
+  <div id="result-section">
+    <div class="result-header">
+      <h2>Extraction Result</h2>
+      <span class="result-badge">✓ Complete</span>
+    </div>
+    <div id="result-output"></div>
+    <div class="raw-toggle" onclick="toggleRaw()">
+      <span>▶</span> View raw JSON
+    </div>
+    <div id="raw-data">
+      <pre id="raw-pre"></pre>
+    </div>
+  </div>
+
+  <!-- Features -->
+  <div class="features">
+    <div class="feature-card">
+      <div class="feature-icon">🤖</div>
+      <div class="feature-title">2-Agent Pipeline</div>
+      <div class="feature-desc">Facts Agent extracts singular data. List Agent intelligently scrapes repeating items.</div>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">⚡</div>
+      <div class="feature-title">Token-Efficient</div>
+      <div class="feature-desc">LLM generates CSS selectors, BeautifulSoup does the heavy lifting locally.</div>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">🎨</div>
+      <div class="feature-title">AI-Rendered Output</div>
+      <div class="feature-desc">The LLM decides how to present your data beautifully, in real-time.</div>
+    </div>
+  </div>
+</main>
+
+<script>
+  const API_BASE = "http://localhost:8000";
+
+  function log(msg, type = "active") {
+    const logEl = document.getElementById("status-log");
+    const line = document.createElement("div");
+    line.className = `log-line ${type}`;
+    line.textContent = `› ${msg}`;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function setProgress(pct, text) {
+    document.getElementById("progress-bar").style.width = pct + "%";
+    document.getElementById("progress-pct").textContent = pct + "%";
+    document.getElementById("progress-text").textContent = text;
+  }
+
+  function toggleRaw() {
+    const el = document.getElementById("raw-data");
+    el.classList.toggle("visible");
+  }
+
+  async function startScrape() {
+    const url = document.getElementById("url").value.trim();
+    const query = document.getElementById("query").value.trim();
+
+    if (!url || !query) {
+      showError("Please provide both a Target URL and an Extraction Requirement.");
+      return;
+    }
+
+    // Reset UI
+    document.getElementById("error-box").classList.remove("visible");
+    document.getElementById("result-section").classList.remove("visible");
+    document.getElementById("status-log").innerHTML = "";
+    document.getElementById("progress-section").classList.add("visible");
+    setProgress(5, "Starting pipeline…");
+
+    const btn = document.getElementById("scrape-btn");
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Extracting…';
+
+    log("Processing natural language query…");
+    setProgress(15, "Running Input Processor…");
+
+    try {
+      log("Launching agents…");
+      setProgress(35, "Running List & Facts Agents…");
+
+      const resp = await fetch(`${API_BASE}/scrape`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url, query })
+      });
+
+      if (!resp.ok) {
+        const err = await resp.json();
+        throw new Error(err.detail || "Server error");
+      }
+
+      setProgress(80, "Generating AI output…");
+      log("Generating HTML presentation…");
+
+      const data = await resp.json();
+
+      setProgress(100, "Complete!");
+      log("Done!", "done");
+
+      // Show result
+      document.getElementById("result-output").innerHTML = data.html_output;
+      document.getElementById("raw-pre").textContent = JSON.stringify(JSON.parse(data.raw_data), null, 2);
+      document.getElementById("result-section").classList.add("visible");
+
+    } catch (err) {
+      showError(err.message || "An unexpected error occurred.");
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = "⚡ Scrape and Extract";
+    }
+  }
+
+  function showError(msg) {
+    const el = document.getElementById("error-box");
+    el.textContent = "⚠ " + msg;
+    el.classList.add("visible");
+    document.getElementById("progress-section").classList.remove("visible");
+  }
+
+  // Allow Enter key in URL field
+  document.addEventListener("DOMContentLoaded", () => {
+    document.getElementById("url").addEventListener("keydown", e => {
+      if (e.key === "Enter") startScrape();
+    });
+  });
+</script>
+</body>
+</html>
