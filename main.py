@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-from ai.groq_client import extract_structured_json
+from ai.groq_client import extract_structured_json, summarize_records
 from scraper.engine import crawl_site, execute_selector_extraction
 
 load_dotenv()
@@ -276,7 +276,7 @@ if run_button:
             print(f"[main] Parsed requested_count={requested_count}")
 
             print("[main] Starting autonomous navigation phase")
-            with st.spinner("Step 1 of 4: Discovering relevant paths with DFS..."):
+            with st.spinner("Step 1 of 4: Running sequential vision navigation..."):
                 navigation_trace = crawl_site(
                     url,
                     extraction_goal=extraction_goal,
@@ -287,10 +287,13 @@ if run_button:
             visited_pages = navigation_trace.get("visited_pages", []) if isinstance(navigation_trace, dict) else []
             terminal_pages = navigation_trace.get("terminal_pages", []) if isinstance(navigation_trace, dict) else []
             seed_urls = navigation_trace.get("seed_urls", []) if isinstance(navigation_trace, dict) else []
+            goal_fields = navigation_trace.get("goal_fields", {}) if isinstance(navigation_trace, dict) else {}
 
             print(
                 f"[main] Navigation complete: visited_pages={len(visited_pages)}, terminal_pages={len(terminal_pages)}"
             )
+            if goal_fields:
+                print(f"[main] Goal fields: {goal_fields}")
             st.success(
                 f"Navigation complete. Pages visited: {len(visited_pages)}. Terminal pages found: {len(terminal_pages)}"
             )
@@ -423,6 +426,12 @@ if run_button:
             records_after_relevance = _filter_relevant_records(records_after_grounding, extraction_goal)
             filtered_records = records_after_relevance[:requested_count]
 
+            with st.spinner("Step 4 of 4: Generating final summary..."):
+                final_summary = summarize_records(
+                    extraction_goal=extraction_goal,
+                    records=filtered_records,
+                )
+
             diagnostics = {
                 "requested_count": requested_count,
                 "selected_url_count": len(selected_urls),
@@ -440,7 +449,9 @@ if run_button:
 
             final_payload = {
                 **extracted,
-                "records": filtered_records,
+                "records": [],
+                "raw_records": filtered_records,
+                "summary": final_summary,
                 "selected_urls": successful_sources,
                 "navigation_trace": navigation_trace,
                 "diagnostics": diagnostics,
@@ -452,6 +463,9 @@ if run_button:
 
             if not filtered_records:
                 st.warning("No relevant records found for the requested requirement.")
+
+            st.subheader("Final Summary")
+            st.write(final_summary)
 
             _render_json_payload(final_payload)
             print("[main] Payload rendered in UI")

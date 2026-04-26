@@ -6,3 +6,4 @@ html2text>=2024.2.26
 python-dotenv
 chromium
 groq>=0.9.0
+Pillow>=10.4.0

@@ -11,11 +11,16 @@ from typing import Any
 from groq import Groq  # type: ignore[import-not-found]
 
 from ai.prompt_builder import (
+    build_goal_fields_prompt,
     build_extraction_prompt,
     build_navigation_prompt,
     build_router_prompt,
     build_vision_navigation_prompt,
 )
+
+
+DEFAULT_TEXT_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 
 def _get_client() -> Groq:
@@ -89,6 +94,42 @@ def _is_model_decommissioned(exc: Exception) -> bool:
     return "model_decommissioned" in message or "decommissioned" in message
 
 
+def _is_model_not_found_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 404:
+        return True
+    error_code = str(getattr(exc, "code", "")).strip().lower()
+    if error_code in {"model_not_found", "404"}:
+        return True
+    message = f"{type(exc).__name__}: {exc}".lower()
+    return "model_not_found" in message or "404" in message
+
+
+def _get_text_model() -> str:
+    candidates = (
+        os.getenv("GROQ_TEXT_MODEL"),
+        os.getenv("GROQ_GOAL_MODEL"),
+        DEFAULT_TEXT_MODEL,
+    )
+    for candidate in candidates:
+        normalized = str(candidate or "").strip()
+        if normalized:
+            return normalized
+    return DEFAULT_TEXT_MODEL
+
+
+def _get_vision_model() -> str:
+    candidates = (
+        os.getenv("GROQ_VISION_MODEL"),
+        DEFAULT_VISION_MODEL,
+    )
+    for candidate in candidates:
+        normalized = str(candidate or "").strip()
+        if normalized:
+            return normalized
+    return DEFAULT_VISION_MODEL
+
+
 def _call_groq_json(prompt: str, model: str) -> Any:
     client = _get_client()
 
@@ -104,6 +145,9 @@ def _call_groq_json(prompt: str, model: str) -> Any:
             return _parse_json_content(response)
         except Exception as exc:
             last_error = exc
+            if _is_model_not_found_error(exc):
+                print(f"Error: Model ID [{model}] is incorrect or unavailable on your Groq tier.")
+                raise
             if not _is_rate_limit_error(exc) or attempt == 3:
                 raise
             sleep_seconds = 0.75 * attempt
@@ -114,6 +158,37 @@ def _call_groq_json(prompt: str, model: str) -> Any:
             time.sleep(sleep_seconds)
 
     raise RuntimeError(f"Groq request failed: {last_error}")
+
+
+def _call_groq_text(prompt: str, model: str) -> str:
+    client = _get_client()
+
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+            message = response.choices[0].message if getattr(response, "choices", None) else None
+            response_content = getattr(message, "content", "")
+            return _extract_json_text(response_content).strip() if isinstance(response_content, list) else str(response_content or "").strip()
+        except Exception as exc:
+            last_error = exc
+            if _is_model_not_found_error(exc):
+                print(f"Error: Model ID [{model}] is incorrect or unavailable on your Groq tier.")
+                raise
+            if not _is_rate_limit_error(exc) or attempt == 3:
+                raise
+            sleep_seconds = 0.75 * attempt
+            print(
+                f"[groq_client] Rate limited on model={model}; retrying in {sleep_seconds:.2f}s "
+                f"(attempt {attempt}/3)"
+            )
+            time.sleep(sleep_seconds)
+
+    raise RuntimeError(f"Groq text request failed: {last_error}")
 
 
 def _coerce_url_list(payload: Any) -> list[str]:
@@ -180,6 +255,15 @@ def _coerce_priority_queue(payload: Any) -> list[dict[str, Any]]:
 
     queue.sort(key=lambda row: int(row.get("priority", 0)))
     return queue
+
+
+def _coerce_goal_fields(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        goal_fields = payload.get("goal_fields")
+        if isinstance(goal_fields, dict):
+            return goal_fields
+        return payload
+    return {}
 
 
 def _normalize_url_value(url: str) -> str:
@@ -393,26 +477,36 @@ def select_relevant_urls(sitemap: list[dict[str, Any]], user_query: str) -> list
 
 def evaluate_traversal_path(
     user_query: str,
+    goal_fields: dict[str, Any] | None,
     page_snippet: str,
     discovered_elements: list[dict[str, Any]],
     screenshot_b64: str = "",
-    sitemap_tree_branch: dict[str, Any] | None = None,
+    sitemap_tree: dict[str, Any] | None = None,
+    current_url: str = "",
+    url_stack: list[str] | None = None,
+    attempted_actions: list[str] | None = None,
+    stuck_turns_current_url: int = 0,
     logic_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Classify a page and rank next navigation actions using the navigator model."""
 
     print("[groq_client] evaluate_traversal_path called")
     result_limit = max(1, min(int((logic_metadata or {}).get("result_limit", 10) or 10), 20))
-    navigator_model = str(os.getenv("GROQ_NAVIGATOR_MODEL", "llama-3.3-70b-versatile")).strip() or "llama-3.3-70b-versatile"
     use_vision = bool(str(screenshot_b64 or "").strip())
+    navigator_model = _get_vision_model() if use_vision else _get_text_model()
 
     if use_vision:
         prompt = build_vision_navigation_prompt(
             user_query=user_query,
+            goal_fields=goal_fields or {},
             page_snippet=page_snippet,
             discovered_elements=discovered_elements,
-            sitemap_tree_branch=sitemap_tree_branch or {},
-            image_base64=screenshot_b64,
+            sitemap_tree=sitemap_tree or {},
+            screenshot_b64=screenshot_b64,
+            current_url=current_url,
+            url_stack=url_stack or [],
+            attempted_actions=attempted_actions or [],
+            stuck_turns=max(0, int(stuck_turns_current_url or 0)),
             result_limit=result_limit,
         )
     else:
@@ -420,6 +514,8 @@ def evaluate_traversal_path(
             user_query=user_query,
             page_snippet=page_snippet,
             discovered_elements=discovered_elements,
+            attempted_actions=attempted_actions or [],
+            stuck_turns=max(0, int(stuck_turns_current_url or 0)),
             result_limit=result_limit,
         )
 
@@ -449,6 +545,28 @@ def evaluate_traversal_path(
         print(f"[groq_client] Traversal evaluation failed: {error_msg}")
         raise RuntimeError(
             f"Groq traversal evaluation failed. Is GROQ_API_KEY configured? Error: {error_msg}"
+        )
+
+
+def extract_goal_fields(user_query: str) -> dict[str, Any]:
+    """Extract structured goal fields from the user query."""
+
+    print("[groq_client] extract_goal_fields called")
+    goal_model = _get_text_model()
+    prompt = build_goal_fields_prompt(user_query)
+
+    try:
+        parsed = _call_groq_json(prompt, model=goal_model)
+        goal_fields = _coerce_goal_fields(parsed)
+        if not goal_fields:
+            raise ValueError("Goal field response JSON is empty")
+        print(f"[groq_client] Goal fields extracted: keys={list(goal_fields.keys())}")
+        return goal_fields
+    except Exception as exc:
+        error_msg = f"{type(exc).__name__}: {exc}"
+        print(f"[groq_client] Goal field extraction failed: {error_msg}")
+        raise RuntimeError(
+            f"Groq goal-field extraction failed. Is GROQ_API_KEY configured? Error: {error_msg}"
         )
 
 
@@ -507,4 +625,32 @@ def extract_structured_json(page_markdown: str, extraction_goal: str) -> dict[st
         print(f"[groq_client] Extraction failed: {error_msg}")
         raise RuntimeError(
             f"Groq processing failed. Is GROQ_API_KEY configured? Error: {error_msg}"
+        )
+
+
+def summarize_records(extraction_goal: str, records: list[dict[str, Any]]) -> str:
+    """Generate a concise natural-language paragraph summary from extracted records."""
+
+    print("[groq_client] summarize_records called")
+    if not isinstance(records, list) or not records:
+        return "No relevant data records were found for the requested extraction goal."
+
+    summary_model = _get_text_model()
+    compact_records = records[:10]
+    prompt = (
+        "You are a data summarization assistant.\n"
+        "Write exactly one concise paragraph (3-6 sentences) that summarizes the extracted results.\n"
+        "Do not output JSON, markdown, or bullet points.\n"
+        f"Extraction Goal:\n{str(extraction_goal or '').strip()}\n\n"
+        f"Extracted Records:\n{json.dumps(compact_records, ensure_ascii=False)}\n"
+    )
+
+    try:
+        summary = _call_groq_text(prompt, model=summary_model)
+        return str(summary or "").strip() or "Summary unavailable."
+    except Exception as exc:
+        error_msg = f"{type(exc).__name__}: {exc}"
+        print(f"[groq_client] Summary generation failed: {error_msg}")
+        raise RuntimeError(
+            f"Groq summary generation failed. Is GROQ_API_KEY configured? Error: {error_msg}"
         )
