@@ -4,6 +4,7 @@ import asyncio
 import json
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
+import urllib.parse
 
 def _ensure_windows_proactor_policy():
     if sys.platform == "win32":
@@ -40,6 +41,7 @@ def find_common_patterns(start_url: str, goal: str, max_pages: int = 50) -> str:
             navigation_steps = 0
             
             while navigation_steps < 3:
+                previous_url = page.url
                 content = page.content()
                 soup = BeautifulSoup(content, "html.parser")
                 
@@ -47,17 +49,25 @@ def find_common_patterns(start_url: str, goal: str, max_pages: int = 50) -> str:
                 for tag in soup(["script", "style", "svg", "noscript", "meta", "head"]):
                     tag.decompose()
                 
+                for tag in soup.find_all(True):
+                    allowed_attrs = ['class', 'href', 'src']
+                    tag.attrs = {k: v for k, v in tag.attrs.items() if k in allowed_attrs}
+                
                 # Convert body to string for LLM analysis
-                html_snippet = soup.prettify()[:15000] # Provide a large chunk of the DOM
+                html_snippet = str(soup.body)[:150000] if soup.body else "" # Provide a dense chunk of the DOM
                 
                 prompt = f"""
                 Goal: {goal}
-                Analyze the following HTML structure. Determine if the repeating items (like books, products, or news articles) that match the Goal are on this page, or if we need to click a link to navigate to a different section (like a 'News', 'Blog', or 'Products' page).
+                Current Page URL: {page.url}
                 
-                If the repeating items ARE NOT on this page, but there is a navigation link that leads to them, return a JSON:
+                Analyze the following HTML structure. Determine if the repeating items (like books, products, or news articles) that match the Goal are on this page, or if we need to navigate to a different section (like a 'News', 'Blog', or 'Products' page).
+                
+                IMPORTANT: Do NOT navigate to the current page. If you are already on the correct page for the Goal, or if the target items are visible below, you must choose 'extract'.
+                
+                If the repeating items ARE NOT on this page, but there is a navigation link that leads to them, extract its href attribute and return a JSON:
                 {{
                     "action": "navigate",
-                    "link_selector": "Valid CSS selector or Playwright selector for the link to click (e.g., 'nav a:has-text(\\"News\\")')"
+                    "target_href": "The exact href attribute of the target link (e.g., '/resources', 'https://example.com/news')"
                 }}
                 
                 If the repeating items ARE on this page, return a JSON to extract them:
@@ -87,19 +97,21 @@ def find_common_patterns(start_url: str, goal: str, max_pages: int = 50) -> str:
                 print(f"[MCP TOOL: Common Finder] LLM Action: {json.dumps(current_recipe, indent=2)}")
                 
                 if current_recipe.get("action") == "navigate":
-                    link_sel = current_recipe.get("link_selector")
-                    if link_sel:
-                        print(f"[MCP TOOL: Common Finder] Navigating to {link_sel}...")
+                    target_href = current_recipe.get("target_href")
+                    if target_href:
+                        absolute_url = urllib.parse.urljoin(page.url, target_href)
+                        print(f"[MCP TOOL: Common Finder] Navigating directly to {absolute_url}...")
                         try:
-                            link_el = page.locator(link_sel).first
-                            link_el.scroll_into_view_if_needed(timeout=5000)
-                            link_el.click(force=True, timeout=5000)
-                            page.wait_for_load_state("domcontentloaded", timeout=15000)
+                            page.goto(absolute_url, wait_until="domcontentloaded", timeout=30000)
                             page.wait_for_timeout(2000)
+                            if page.url.rstrip('/') == previous_url.rstrip('/'):
+                                print("[MCP TOOL: Common Finder] Navigation failed (URL did not change). Breaking loop.")
+                                recipe = current_recipe
+                                break
                             navigation_steps += 1
                             continue
                         except Exception as e:
-                            print(f"[MCP TOOL: Common Finder] Failed to click navigation link: {e}")
+                            print(f"[MCP TOOL: Common Finder] Failed to navigate: {e}")
                             recipe = current_recipe
                             break
                     else:
