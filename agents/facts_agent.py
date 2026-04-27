@@ -3,6 +3,7 @@ import sys
 import asyncio
 import json
 import urllib.parse
+import re
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, Page
 from typing import List
@@ -23,7 +24,55 @@ def safe_goto(page: Page, url: str) -> bool:
     return False
 
 
-def run_unstructure_agent(url: str, unstructure_def: List[FieldDef]):
+def _extract_tokens(user_query: str, missing_fields: List[str]) -> set:
+    stop = {
+        "who", "is", "what", "where", "the", "a", "an", "and", "or", "for", "with", "from",
+        "give", "tell", "me", "his", "her", "their", "role", "domain", "works", "work", "does",
+        "did", "details", "information", "about", "profile"
+    }
+    corpus = f"{user_query} {' '.join(missing_fields)}".lower()
+    tokens = set(re.findall(r"[a-z][a-z0-9_-]{2,}", corpus))
+    return {t for t in tokens if t not in stop}
+
+
+def _build_candidate_links(page_url: str, soup: BeautifulSoup, user_query: str, missing_fields: List[str]) -> list:
+    tokens = _extract_tokens(user_query, missing_fields)
+    candidates = []
+    seen = set()
+
+    for a in soup.select("a[href]"):
+        href = (a.get("href") or "").strip()
+        if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+            continue
+        absolute = urllib.parse.urljoin(page_url, href)
+        if absolute in seen:
+            continue
+        seen.add(absolute)
+
+        text = a.get_text(separator=" ", strip=True)
+        text_l = text.lower()
+        abs_l = absolute.lower()
+
+        score = 0
+        for t in tokens:
+            if t in abs_l:
+                score += 4
+            if t in text_l:
+                score += 3
+
+        if any(k in abs_l for k in ["team", "member", "leadership", "about", "people", "profile", "bio"]):
+            score += 2
+        if any(k in text_l for k in ["team", "leadership", "about", "profile", "bio"]):
+            score += 2
+
+        if score > 0:
+            candidates.append({"href": absolute, "text": text[:120], "score": score})
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    return candidates[:10]
+
+
+def run_unstructure_agent(url: str, unstructure_def: List[FieldDef], user_query: str = ""):
     if not unstructure_def:
         return {}
 
@@ -97,10 +146,21 @@ def run_unstructure_agent(url: str, unstructure_def: List[FieldDef]):
 
             print(f"[Facts Agent] ⚠  Still missing: {missing_fields}. Looking for a navigation link...")
 
+            candidate_links = _build_candidate_links(page.url, soup, user_query, missing_fields)
+            candidate_text = "\n".join(
+                [f"- text='{c['text']}' | href='{c['href']}' | score={c['score']}" for c in candidate_links]
+            )
+
             nav_prompt = f"""
             We are still missing facts: {missing_fields}.
-            Look at the following HTML snippet and find a navigation link that might contain this info (e.g. 'About Us', 'Contact').
-            Return JSON: {{"target_href": "/link"}} or {{"target_href": null}}
+            User query context: "{user_query}"
+            Choose ONE best candidate link that is most likely to contain the missing facts.
+            Return JSON: {{"target_href": "/link-or-absolute-url"}} or {{"target_href": null}}
+
+            Candidate Links:
+            {candidate_text}
+
+            HTML Snippet (fallback context):
             HTML Snippet: {str(soup.body)[:8000]}
             """
 
@@ -113,6 +173,10 @@ def run_unstructure_agent(url: str, unstructure_def: List[FieldDef]):
             nav_action = json.loads(nav_res.choices[0].message.content)
             target_href = nav_action.get("target_href")
             print(f"[Facts Agent] LLM Nav Decision: {nav_action}")
+
+            if (not target_href) and candidate_links:
+                target_href = candidate_links[0]["href"]
+                print(f"[Facts Agent] ⚠  LLM returned null. Using top heuristic candidate: {target_href}")
 
             if target_href:
                 absolute_url = urllib.parse.urljoin(page.url, target_href)

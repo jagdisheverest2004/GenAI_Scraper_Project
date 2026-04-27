@@ -72,4 +72,31 @@ def process_query(query: str) -> ScrapeManifest:
     )
 
     data = json.loads(response.choices[0].message.content)
-    return ScrapeManifest(**data)
+    manifest = ScrapeManifest(**data)
+
+    # Guardrail: person-profile questions often contain multiple singular asks that the LLM may collapse.
+    q = query.lower()
+    is_person_query = any(k in q for k in ["who is", "who's", "profile", "about"])
+    asks_role = "role" in q or "title" in q or "position" in q
+    asks_domain = "domain" in q or "team" in q or "department" in q or "practice" in q
+    asks_current = "what he does" in q or "what she does" in q or "responsibil" in q or "currently" in q
+    asks_past = "what he did" in q or "what she did" in q or "previous" in q or "past" in q or "experience" in q
+
+    if is_person_query and any([asks_role, asks_domain, asks_current, asks_past]):
+        existing_names = {f.name.strip().lower() for f in manifest.unstructure}
+
+        def add_field(name: str, description: str):
+            if name.lower() not in existing_names:
+                manifest.unstructure.append(FieldDef(name=name, description=description))
+                existing_names.add(name.lower())
+
+        if asks_role and all(k not in existing_names for k in ["role", "title", "position"]):
+            add_field("role", "Current role or title of the person")
+        if asks_domain and all(k not in existing_names for k in ["domain", "team", "practice", "department"]):
+            add_field("domain", "Domain, team, or practice area where the person works")
+        if asks_current and all(k not in existing_names for k in ["current_responsibilities", "responsibilities", "current_focus"]):
+            add_field("current_responsibilities", "What the person currently does")
+        if asks_past and all(k not in existing_names for k in ["past_experience", "previous_experience", "background"]):
+            add_field("past_experience", "What the person previously did or prior experience")
+
+    return manifest

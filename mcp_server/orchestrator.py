@@ -63,11 +63,11 @@ def run_orchestrator(start_url: str, query: str) -> str:
 
     if manifest.unstructure:
         print("[Orchestrator] Running Facts Agent...")
-        result["facts_data"] = run_facts_agent(start_url, manifest.unstructure)
+        result["facts_data"] = run_facts_agent(start_url, manifest.unstructure, query)
 
     if manifest.structure:
         print(f"[Orchestrator] Running List Agent... (scan: {manifest.scan_limit} items, output: {manifest.limit} items)")
-        raw_items = run_list_agent(start_url, manifest.structure, item_limit=manifest.scan_limit)
+        raw_items = run_list_agent(start_url, manifest.structure, item_limit=manifest.scan_limit, filter_hint=manifest.filter_hint)
 
         if manifest.filter_hint:
             result["list_data"] = _apply_filter(raw_items, manifest.filter_hint, manifest.limit)
